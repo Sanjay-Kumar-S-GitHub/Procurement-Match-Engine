@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sqlalchemy
+asyncpg
+qdrant-client
+google-genai
+pydantic
+python-dotenv
+pydantic-settings
+python-multipart
