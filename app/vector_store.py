@@ -111,7 +111,7 @@ def search_catalog(query_vector: list[float], vendor_hsn_code: str):
 
 async def get_embedding(text: str) -> List[float]:
     """
-    Generates a 768-dimensional text embedding using Gemini's text-embedding-004 model.
+    Generates a 768-dimensional text embedding using Gemini's gemini-embedding-2 model.
     """
     if not text:
         return [0.0] * 768

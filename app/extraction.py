@@ -34,6 +34,47 @@ class InvoiceExtractionResult(BaseModel):
     irn_no: Optional[str] = None
     line_items: List[InvoiceLineItemExtracted]
 
+class LLMRerankDecision(BaseModel):
+    selected_internal_sku: str
+    confidence_score: float
+    reasoning: str
+
+
+async def rerank_candidates(vendor_item_name: str, vendor_hsn: str, vendor_price: float, candidates_json: str) -> LLMRerankDecision:
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    
+    prompt = f"""You are an expert procurement AI. Your task is to match a vendor's raw invoice line item to the correct internal catalog product from a list of top vector-search candidates.
+    
+--- VENDOR INVOICE ITEM ---
+Description: {vendor_item_name}
+HSN Code: {vendor_hsn}
+Unit Price: {vendor_price}
+    
+--- CANDIDATE INTERNAL PRODUCTS ---
+{candidates_json}
+    
+Instructions:
+1. Analyze the vendor description for abbreviations, part numbers, and semantic meaning.
+2. Compare the vendor's 'Unit Price' against the candidate's 'average_purchase_price'. A match should make financial sense.
+3. Factor in the vector 'score'. Higher scores are mathematically closer in meaning.
+4. Select the exact `internal_sku` of the correct item.
+5. If absolutely none of the candidates are a logical match, return "NONE" for the SKU."""
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=LLMRerankDecision,
+        temperature=0.1
+    )
+    
+    response = await client.aio.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=config,
+    )
+    
+    # pyright might complain about response.text being None, but Gemini usually returns string
+    text = response.text or "{}"
+    return LLMRerankDecision.model_validate_json(text)
 
 async def extract_invoice(file_bytes: bytes, mime_type: str) -> InvoiceExtractionResult:
     """

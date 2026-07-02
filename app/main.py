@@ -7,7 +7,8 @@ from sqlalchemy.future import select
 from sqlalchemy.dialects.postgresql import insert
 from app.database import engine, Base, get_db, AsyncSessionLocal
 import app.models as models
-from app.extraction import extract_invoice
+from app.extraction import extract_invoice, rerank_candidates
+import json
 from app.vector_store import search_catalog, initialize_qdrant_collection, get_embedding, upsert_catalog_vector, get_collection_count
 
 async def perform_catalog_sync(db: AsyncSession) -> int:
@@ -188,8 +189,30 @@ async def process_invoice(
                         evaluated_item["recommended_sku"] = candidates[0]["internal_sku"]
                         evaluated_item["candidates"] = candidates
                     else:
-                        evaluated_item["status"] = "RECOMMEND_LLM_CHOICE"
-                        evaluated_item["candidates"] = candidates
+                        candidates_json = json.dumps(candidates, indent=2)
+                        
+                        decision = await rerank_candidates(
+                            vendor_item_name=item.vendor_product_name,
+                            vendor_hsn=item.vendor_hsn_code,
+                            vendor_price=item.unit_price,
+                            candidates_json=candidates_json
+                        )
+                        
+                        if decision.selected_internal_sku != "NONE":
+                            evaluated_item["status"] = "RECOMMEND_TOP_1"
+                            evaluated_item["recommended_sku"] = decision.selected_internal_sku
+                            evaluated_item["reasoning"] = decision.reasoning
+                            
+                            # Filter candidates to only contain the winning candidate
+                            winning_candidate = next((c for c in candidates if c["internal_sku"] == decision.selected_internal_sku), None)
+                            if winning_candidate:
+                                evaluated_item["candidates"] = [winning_candidate]
+                            else:
+                                evaluated_item["status"] = "NO_MATCH_FOUND"
+                                evaluated_item["candidates"] = []
+                        else:
+                            evaluated_item["status"] = "NO_MATCH_FOUND"
+                            evaluated_item["candidates"] = []
             
             evaluated_line_items.append(evaluated_item)
             
