@@ -5,11 +5,35 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.dialects.postgresql import insert
-
-from app.database import engine, Base, get_db
+from app.database import engine, Base, get_db, AsyncSessionLocal
 import app.models as models
 from app.extraction import extract_invoice
-from app.vector_store import search_catalog, initialize_qdrant_collection
+from app.vector_store import search_catalog, initialize_qdrant_collection, get_embedding, upsert_catalog_vector, get_collection_count
+
+async def perform_catalog_sync(db: AsyncSession) -> int:
+    query = select(models.InternalProductCatalog)
+    result = await db.execute(query)
+    products = result.scalars().all()
+    
+    synced_count = 0
+    for product in products:
+        if not product.internal_product_name:
+            continue
+            
+        # Generate real text embedding
+        vector = await get_embedding(product.internal_product_name) # type: ignore
+        
+        # Upsert into Qdrant
+        upsert_catalog_vector(
+            internal_sku=product.internal_sku, # type: ignore
+            vector=vector,
+            internal_product_name=product.internal_product_name, # type: ignore
+            hsn_code=product.hsn_code or "", # type: ignore
+            average_purchase_price=product.average_purchase_price or 0.0 # type: ignore
+        )
+        synced_count += 1
+        
+    return synced_count
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -20,6 +44,16 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         # Note: In a production environment, use migrations (Alembic) instead of create_all
         await conn.run_sync(Base.metadata.create_all)
+
+    # Check Qdrant point count
+    count = get_collection_count()
+    if count == 0:
+        print("Qdrant collection is empty. Auto-running catalog synchronization...")
+        async with AsyncSessionLocal() as session:
+            await perform_catalog_sync(session)
+    else:
+        print("Qdrant collection already initialized. Skipping auto-sync.")
+
     yield
     # Dispose of engine connection pool on shutdown
     await engine.dispose()
@@ -122,8 +156,8 @@ async def process_invoice(
                     evaluated_item["internal_sku"] = mapping.internal_sku
             else:
                 # Step C: Not found in cache -> Query Vector Store
-                # Mocking vector generation for vendor_product_name as requested
-                vector = [0.0] * 768 
+                # Generate real text embedding for the vendor product name
+                vector = await get_embedding(item.vendor_product_name)
                 
                 # Search strictly filtering on HSN code
                 search_results = search_catalog(query_vector=vector, vendor_hsn_code=item.vendor_hsn_code)
@@ -133,7 +167,7 @@ async def process_invoice(
                     payload = res.payload or {}
                     candidates.append({
                         "internal_sku": str(res.id),
-                        "score": float(res.score),
+                        "score": res.score,
                         "product_name": payload.get("internal_product_name"),
                         "hsn_code": payload.get("hsn_code"),
                         "average_purchase_price": payload.get("average_purchase_price")
@@ -292,3 +326,22 @@ async def commit_invoice(
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/sync-catalog")
+async def sync_catalog(db: AsyncSession = Depends(get_db)):
+    """
+    Pulls all products from the internal catalog and synchronously generates 
+    and upserts their text embeddings into the Qdrant vector database.
+    """
+    try:
+        synced_count = await perform_catalog_sync(db)
+        
+        return {
+            "status": "success", 
+            "synced_count": synced_count, 
+            "message": "Catalog successfully embedded and synced to Qdrant."
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to sync catalog: {str(e)}")

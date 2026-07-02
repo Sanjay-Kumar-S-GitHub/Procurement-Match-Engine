@@ -1,3 +1,4 @@
+from typing import List
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, 
@@ -8,6 +9,9 @@ from qdrant_client.models import (
     MatchValue,
     PayloadSchemaType
 )
+
+from google import genai
+from google.genai import types
 
 from app.config import settings
 
@@ -39,6 +43,16 @@ def initialize_qdrant_collection():
         print(f"Collection '{COLLECTION_NAME}' created successfully with 'hsn_code' index.")
     else:
         print(f"Collection '{COLLECTION_NAME}' already exists.")
+
+def get_collection_count() -> int:
+    """
+    Returns the total number of points in the vector collection.
+    """
+    try:
+        response = client.count(collection_name=COLLECTION_NAME)
+        return response.count
+    except Exception:
+        return 0
 
 
 def upsert_catalog_vector(
@@ -93,3 +107,21 @@ def search_catalog(query_vector: list[float], vendor_hsn_code: str):
     )
 
     return results.points
+
+
+async def get_embedding(text: str) -> List[float]:
+    """
+    Generates a 768-dimensional text embedding using Gemini's text-embedding-004 model.
+    """
+    if not text:
+        return [0.0] * 768
+        
+    client_genai = genai.Client(api_key=settings.GEMINI_API_KEY)
+    response = await client_genai.aio.models.embed_content(
+        model="gemini-embedding-2",
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
+    if not response.embeddings or not response.embeddings[0].values:
+        return [0.0] * 768
+    return response.embeddings[0].values # type: ignore
