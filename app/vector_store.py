@@ -54,6 +54,30 @@ def get_collection_count() -> int:
     except Exception:
         return 0
 
+def get_all_catalog_skus() -> set[str]:
+    """
+    Returns a set of all internal_sku (point IDs) currently stored in Qdrant.
+    """
+    skus = set()
+    offset = None
+    try:
+        while True:
+            results, next_offset = client.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=1000,
+                with_payload=False,
+                with_vectors=False,
+                offset=offset
+            )
+            for res in results:
+                skus.add(str(res.id))
+            
+            if next_offset is None:
+                break
+            offset = next_offset
+    except Exception:
+        pass
+    return skus
 
 def upsert_catalog_vector(
     internal_sku: str,
@@ -125,3 +149,22 @@ async def get_embedding(text: str) -> List[float]:
     if not response.embeddings or not response.embeddings[0].values:
         return [0.0] * 768
     return response.embeddings[0].values # type: ignore
+
+
+async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """
+    Generates text embeddings for a batch of strings.
+    """
+    if not texts:
+        return []
+        
+    client_genai = genai.Client(api_key=settings.GEMINI_API_KEY)
+    response = await client_genai.aio.models.embed_content(
+        model="gemini-embedding-2",
+        contents=texts,
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
+    if not response.embeddings:
+        return [[0.0] * 768 for _ in texts]
+        
+    return [e.values for e in response.embeddings] # type: ignore

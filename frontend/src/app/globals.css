@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: #09090b; 
+  --color-foreground: #fafafa; 
+  --color-card: #18181b;       
+  --color-border: #27272a;     
+  --color-accent: #8b5cf6;     
+  --color-accent-hover: #7c3aed; 
+  --color-success: #10b981;    
+  --color-warning: #f59e0b;    
+  --color-danger: #ef4444;     
+  
+  --font-sans: "Inter", var(--font-geist-sans), sans-serif;
+  --font-mono: var(--font-geist-mono), monospace;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    margin: 0;
+    min-height: 100vh;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    background: rgba(24, 24, 27, 0.65);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  
+  .glass-input {
+    background: rgba(39, 39, 42, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--color-foreground);
+    transition: all 0.2s ease-in-out;
+  }
+  
+  .glass-input:focus {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.2);
+  }
+  
+  .glass-button {
+    background: linear-gradient(135deg, var(--color-accent), #3b82f6);
+    color: white;
+    font-weight: 500;
+    transition: all 0.2s ease;
+    border: none;
+    cursor: pointer;
+  }
+  
+  .glass-button:hover {
+    box-shadow: 0 4px 15px rgba(139, 92, 246, 0.4);
+    transform: translateY(-1px);
+  }
+  
+  .glass-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+}

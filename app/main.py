@@ -1,40 +1,63 @@
 from typing import Any, List, Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from app.database import engine, Base, get_db, AsyncSessionLocal
 import app.models as models
 from app.extraction import extract_invoice, rerank_candidates
 import json
-from app.vector_store import search_catalog, initialize_qdrant_collection, get_embedding, upsert_catalog_vector, get_collection_count
+import asyncio
+from app.vector_store import search_catalog, initialize_qdrant_collection, get_embedding, upsert_catalog_vector, get_collection_count, get_all_catalog_skus, get_embeddings_batch
 
-async def perform_catalog_sync(db: AsyncSession) -> int:
+async def perform_catalog_sync(db: AsyncSession) -> dict[str, int]:
+    # 1. Fetch existing SKUs from Qdrant
+    existing_skus = get_all_catalog_skus()
+    
     query = select(models.InternalProductCatalog)
     result = await db.execute(query)
-    products = result.scalars().all()
+    all_products = result.scalars().all()
     
+    # 2. Filter products
+    missing_products = [
+        p for p in all_products 
+        if p.internal_product_name and str(p.internal_sku) not in existing_skus
+    ]
+    
+    skipped_count = len(all_products) - len(missing_products)
     synced_count = 0
-    for product in products:
-        if not product.internal_product_name:
-            continue
+    
+    for item in missing_products:
+        try:
+            internal_product_name = str(item.internal_product_name) # type: ignore
+            internal_sku = str(item.internal_sku) # type: ignore
             
-        # Generate real text embedding
-        vector = await get_embedding(product.internal_product_name) # type: ignore
-        
-        # Upsert into Qdrant
-        upsert_catalog_vector(
-            internal_sku=product.internal_sku, # type: ignore
-            vector=vector,
-            internal_product_name=product.internal_product_name, # type: ignore
-            hsn_code=product.hsn_code or "", # type: ignore
-            average_purchase_price=product.average_purchase_price or 0.0 # type: ignore
-        )
-        synced_count += 1
-        
-    return synced_count
+            vector = await get_embedding(internal_product_name)
+            
+            upsert_catalog_vector(
+                internal_sku=internal_sku,
+                vector=vector,
+                internal_product_name=internal_product_name,
+                hsn_code=str(item.hsn_code) if item.hsn_code else "", # type: ignore
+                average_purchase_price=float(item.average_purchase_price) if item.average_purchase_price else 0.0 # type: ignore
+            )
+            
+            synced_count += 1
+            print(f"Successfully synced: {internal_sku}")
+            
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            internal_sku_error = str(item.internal_sku) # type: ignore
+            print(f"Failed on {internal_sku_error}: {e}. Pausing for 10 seconds...")
+            await asyncio.sleep(10)
+            
+    print("Full catalog synchronized successfully.")
+
+    return {"items_skipped": skipped_count, "items_synced": synced_count}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,14 +69,19 @@ async def lifespan(app: FastAPI):
         # Note: In a production environment, use migrations (Alembic) instead of create_all
         await conn.run_sync(Base.metadata.create_all)
 
-    # Check Qdrant point count
-    count = get_collection_count()
-    if count == 0:
-        print("Qdrant collection is empty. Auto-running catalog synchronization...")
-        async with AsyncSessionLocal() as session:
+    # Compare Qdrant vs PostgreSQL point counts
+    qdrant_count = get_collection_count()
+    
+    async with AsyncSessionLocal() as session:
+        count_query = select(func.count()).select_from(models.InternalProductCatalog)
+        count_result = await session.execute(count_query)
+        postgres_count = count_result.scalar() or 0
+        
+        if qdrant_count < postgres_count:
+            print(f"Partial sync detected ({qdrant_count}/{postgres_count}). Auto-running catalog synchronization...")
             await perform_catalog_sync(session)
-    else:
-        print("Qdrant collection already initialized. Skipping auto-sync.")
+        else:
+            print("Qdrant collection fully synchronized. Skipping auto-sync.")
 
     yield
     # Dispose of engine connection pool on shutdown
@@ -66,9 +94,36 @@ app = FastAPI(
     version="1.0.0"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to Procurement Match Engine API"}
+
+@app.get("/api/v1/catalog")
+async def get_catalog(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(
+        models.InternalProductCatalog.internal_sku,
+        models.InternalProductCatalog.internal_product_name,
+        models.InternalProductCatalog.average_purchase_price,
+        models.InternalProductCatalog.hsn_code
+    ))
+    rows = result.all()
+    catalog = []
+    for row in rows:
+        catalog.append({
+            "internal_sku": row.internal_sku,
+            "internal_product_name": row.internal_product_name,
+            "average_purchase_price": row.average_purchase_price,
+            "hsn_code": row.hsn_code
+        })
+    return catalog
 
 @app.post("/api/v1/process-invoice")
 async def process_invoice(
@@ -206,7 +261,7 @@ async def process_invoice(
                             # Filter candidates to only contain the winning candidate
                             winning_candidate = next((c for c in candidates if c["internal_sku"] == decision.selected_internal_sku), None)
                             if winning_candidate:
-                                evaluated_item["candidates"] = [winning_candidate]
+                                evaluated_item["candidates"] = candidates
                             else:
                                 evaluated_item["status"] = "NO_MATCH_FOUND"
                                 evaluated_item["candidates"] = []
@@ -254,6 +309,8 @@ class ConfirmedLineItem(BaseModel):
     discount: float = 0.0
     net_total: float
     internal_sku: str
+    new_product_name: Optional[str] = None
+    is_new_product: bool = False
 
 class CommitInvoiceRequest(BaseModel):
     vendor_gstin: str
@@ -271,6 +328,28 @@ async def commit_invoice(
             raw_total = item.unit_price * item.quantity
             discount_amount = raw_total * item.discount
             calculated_net_total = raw_total - discount_amount + item.cgst_amount + item.sgst_amount
+            
+            # Action 0: Pre-insert new catalog item if requested
+            if item.is_new_product and item.new_product_name:
+                new_catalog_item = models.InternalProductCatalog(
+                    internal_sku=item.internal_sku,
+                    internal_product_name=item.new_product_name,
+                    hsn_code=item.vendor_hsn_code,
+                    latest_unit_price=item.unit_price,
+                    average_purchase_price=item.unit_price,
+                    total_quantity_purchased=int(item.quantity)
+                )
+                db.add(new_catalog_item)
+                
+                # Generate embedding and upsert to Qdrant instantly
+                vector = await get_embedding(item.new_product_name)
+                upsert_catalog_vector(
+                    internal_sku=item.internal_sku,
+                    internal_product_name=item.new_product_name,
+                    hsn_code=item.vendor_hsn_code,
+                    average_purchase_price=item.unit_price,
+                    vector=vector
+                )
             
             # Action A: Ledger Write
             stmt_line_item = insert(models.PurchaseInvoiceLineItem).values(
@@ -324,7 +403,7 @@ async def commit_invoice(
             catalog_result = await db.execute(catalog_query)
             catalog_item = catalog_result.scalar_one_or_none()
             
-            if catalog_item:
+            if catalog_item and not item.is_new_product:
                 old_avg = float(catalog_item.average_purchase_price) if catalog_item.average_purchase_price is not None else 0.0 # type: ignore
                 old_qty = float(catalog_item.total_quantity_purchased) if catalog_item.total_quantity_purchased is not None else 0.0 # type: ignore
                 
@@ -358,11 +437,12 @@ async def sync_catalog(db: AsyncSession = Depends(get_db)):
     and upserts their text embeddings into the Qdrant vector database.
     """
     try:
-        synced_count = await perform_catalog_sync(db)
+        sync_result = await perform_catalog_sync(db)
         
         return {
             "status": "success", 
-            "synced_count": synced_count, 
+            "items_skipped": sync_result["items_skipped"],
+            "items_synced": sync_result["items_synced"], 
             "message": "Catalog successfully embedded and synced to Qdrant."
         }
         
