@@ -109,6 +109,16 @@ def upsert_catalog_vector(
         points=[point]
     )
 
+def update_catalog_price_metadata(internal_sku: str, new_average_price: float):
+    """
+    Updates the Qdrant payload metadata for average_purchase_price without regenerating vectors.
+    """
+    client.set_payload(
+        collection_name=COLLECTION_NAME,
+        payload={"average_purchase_price": new_average_price},
+        points=[internal_sku]
+    )
+
 def search_catalog(query_vector: list[float], vendor_hsn_code: str):
     """
     Perform a vector search returning the top 5 results whose

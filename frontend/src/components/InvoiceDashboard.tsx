@@ -65,6 +65,7 @@ export default function InvoiceDashboard() {
   const [headerData, setHeaderData] = useState<InvoiceHeader | null>(null);
   const [lineItems, setLineItems] = useState<LineItem[]>([]);
   const [commitStatus, setCommitStatus] = useState<string | null>(null);
+  const [duplicateError, setDuplicateError] = useState<string | null>(null);
   const [fullCatalog, setFullCatalog] = useState<CatalogItem[]>([]);
   
   // Search state per row (index mapped)
@@ -97,6 +98,7 @@ export default function InvoiceDashboard() {
     if (!file) return;
     setIsLoading(true);
     setCommitStatus(null);
+    setDuplicateError(null);
     setHeaderData(null);
     setLineItems([]);
     setSearchQueries({});
@@ -111,7 +113,17 @@ export default function InvoiceDashboard() {
         body: formData,
       });
 
-      if (!res.ok) throw new Error("Failed to process invoice");
+      if (!res.ok) {
+        if (res.status === 409) {
+          const errorData = await res.json();
+          if (errorData.detail && errorData.detail.includes("DUPLICATE_INVOICE")) {
+            const detailMsg = errorData.detail.replace("DUPLICATE_INVOICE: ", "");
+            setDuplicateError(`⚠️ Duplicate invoice is being blocked. ${detailMsg}`);
+            throw new Error("Duplicate invoice detected.");
+          }
+        }
+        throw new Error("Failed to process invoice");
+      }
 
       const data: ProcessResponse = await res.json();
       setHeaderData(data.header);
@@ -139,7 +151,9 @@ export default function InvoiceDashboard() {
       setLineItems(initializedItems);
     } catch (error) {
       console.error(error);
-      alert("Error processing invoice.");
+      if (!(error instanceof Error && error.message === "Duplicate invoice detected.")) {
+        alert("Error processing invoice.");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -232,7 +246,17 @@ export default function InvoiceDashboard() {
         </div>
       </div>
 
-      {headerData && (
+      {duplicateError && (
+        <div className="bg-warning/20 border-l-4 border-warning p-6 rounded-2xl shadow-2xl text-warning font-semibold text-lg animate-fade-in flex items-center gap-4">
+          <span className="text-3xl">🛑</span>
+          <div>
+            <h3 className="font-bold text-white">Duplicate Invoice Blocked</h3>
+            <p className="text-warning-light">{duplicateError}</p>
+          </div>
+        </div>
+      )}
+
+      {headerData && !duplicateError && (
         <div className="glass-panel p-6 rounded-2xl animate-fade-in shadow-2xl space-y-6">
           <h2 className="text-xl font-semibold text-white/90 border-b border-white/10 pb-2">Invoice Header Details</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">

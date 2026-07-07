@@ -12,7 +12,16 @@ import app.models as models
 from app.extraction import extract_invoice, rerank_candidates
 import json
 import asyncio
-from app.vector_store import search_catalog, initialize_qdrant_collection, get_embedding, upsert_catalog_vector, get_collection_count, get_all_catalog_skus, get_embeddings_batch
+from app.vector_store import (
+    search_catalog, 
+    initialize_qdrant_collection, 
+    get_embedding, 
+    upsert_catalog_vector, 
+    get_collection_count, 
+    get_all_catalog_skus, 
+    get_embeddings_batch,
+    update_catalog_price_metadata
+)
 
 async def perform_catalog_sync(db: AsyncSession) -> dict[str, int]:
     # 1. Fetch existing SKUs from Qdrant
@@ -135,6 +144,20 @@ async def process_invoice(
         file_bytes = await file.read()
         mime_type = file.content_type or "application/pdf"
         extraction_result = await extract_invoice(file_bytes, mime_type)
+        
+        # Check for duplicates
+        existing_header_query = select(models.PurchaseInvoiceHeader).where(
+            models.PurchaseInvoiceHeader.vendor_gstin == extraction_result.vendor_gstin,
+            models.PurchaseInvoiceHeader.invoice_no == extraction_result.invoice_no
+        )
+        existing_header_result = await db.execute(existing_header_query)
+        existing_header = existing_header_result.scalar_one_or_none()
+        
+        if existing_header:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"DUPLICATE_INVOICE: Invoice #{extraction_result.invoice_no} from this vendor is already recorded in the ledger."
+            )
         
         # 2. Insert or update the purchase_invoice_headers table via PostgreSQL upsert
         stmt = insert(models.PurchaseInvoiceHeader).values(
@@ -291,6 +314,9 @@ async def process_invoice(
             "evaluated_line_items": evaluated_line_items
         }
         
+    except HTTPException as he:
+        await db.rollback()
+        raise he
     except Exception as e:
         # Rollback any pending database operations upon failure
         await db.rollback()
@@ -420,6 +446,9 @@ async def commit_invoice(
                 catalog_item.latest_unit_price = new_price
                 catalog_item.average_purchase_price = new_avg
                 catalog_item.total_quantity_purchased = int(new_total_qty)
+                
+                # Update Qdrant metadata instantly without recalculating embeddings
+                update_catalog_price_metadata(internal_sku=item.internal_sku, new_average_price=new_avg)
                 
         # Commit the transaction after successfully processing all line items
         await db.commit()
